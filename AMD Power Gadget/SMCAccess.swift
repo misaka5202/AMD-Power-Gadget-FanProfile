@@ -163,9 +163,8 @@ final class SMCAccess {
         var t = info.dataType
         var s = ""
         for _ in 0..<4 {
-            if let scalar = UnicodeScalar(UInt8(t >> 24)) {
-                s.append(Character(scalar))
-            }
+            // UnicodeScalar(UInt8) is non-failable in Swift 5.
+            s.append(Character(UnicodeScalar(UInt8(t >> 24))))
             t <<= 8
         }
         return s
