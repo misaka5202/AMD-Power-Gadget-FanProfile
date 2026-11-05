@@ -32,9 +32,19 @@ jobs:
       - name: Build the app target
         run: |
           set -euo pipefail
-          # Only the GUI app matters here. It is pure Swift + AppKit, no kext
-          # or kernel headers involved, so this is a real compile of the
-          # Swift changes and will fail on any type or syntax error.
+          # The app's Copy Files phase embeds APGLaunchHelper.app, but the
+          # project does not declare a target dependency for it, so building
+          # the app target alone fails with:
+          #   lstat(.../build/Release/APGLaunchHelper.app): No such file
+          # Build the helper first, then the app.
+          xcodebuild \
+            -project SMCAMDProcessor.xcodeproj \
+            -target APGLaunchHelper \
+            -configuration Release \
+            ARCHS=x86_64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee helper.log
+
           xcodebuild \
             -project SMCAMDProcessor.xcodeproj \
             -target "AMD Power Gadget" \
@@ -82,5 +92,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: app-log
-          path: app.log
+          path: |
+            app.log
+            helper.log
           if-no-files-found: ignore
