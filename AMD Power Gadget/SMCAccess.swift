@@ -7,25 +7,70 @@
 //  IOUserClient (setCPB / setPPM / setLPM), so nothing about the working
 //  CPU path changes.
 //
-//  Reads are always allowed. Writes go through AppleSmcBridge's
-//  KERNEL_INDEX_SMC write selector, which requires root: a non-root call
-//  returns kIOReturnNotPrivileged and we surface that instead of silently
-//  pretending the profile changed.
+//  Reads are always allowed. Writes go through AppleSMC's write selector,
+//  which requires root: a non-root call returns kIOReturnNotPrivileged and
+//  callers surface that instead of silently pretending the profile changed.
 //
 
 import Foundation
 import IOKit
 
+/// Mirrors SMCKeyData_t. The field order and packing matter: AppleSMC
+/// interprets this buffer as a raw struct, so it must stay byte identical.
+struct SMCKeyData {
+    struct KeyInfo {
+        var dataSize: UInt32 = 0
+        var dataType: UInt32 = 0
+        var dataAttributes: UInt8 = 0
+    }
+
+    struct KeyData {
+        var key: UInt32 = 0
+        var vers: UInt8 = 0
+        var pLimit: UInt16 = 0
+        var lTotal: UInt16 = 0
+        var result: UInt8 = 0
+        var status: UInt8 = 0
+        var data8: UInt8 = 0
+        var data32: UInt32 = 0
+        var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
+            (0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+             0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0)
+    }
+
+    var key: UInt32 = 0
+    var vers: UInt8 = 0
+    var pLimit: UInt16 = 0
+    var lTotal: UInt16 = 0
+    var result: UInt8 = 0
+    var status: UInt8 = 0
+    var data8: UInt8 = 0
+    var data32: UInt32 = 0
+    var keyInfo = KeyInfo()
+    var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
+        (0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
+         0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0)
+}
+
 final class SMCAccess {
 
     static let shared = SMCAccess()
 
-    // AppleSMC user client selectors (see VirtualSMC's AppleSmcBridge.hpp).
-    private let kSMCUserClientOpen:    UInt32 = 0
-    private let kSMCUserClientClose:   UInt32 = 1
-    private let kSMCHandleYPCEvent:    UInt32 = 2
-    private let kSMCReadKey:           UInt32 = 5
-    private let kSMCWriteKey:          UInt32 = 6
+    // AppleSMC user client selectors.
+    private let kSMCUserClientOpen: UInt32 = 0
+    private let kSMCUserClientClose: UInt32 = 1
+    private let kSMCHandleYPCEvent: UInt32 = 2
+
+    // data8 command codes used inside SMCKeyData.
+    private let kSMCReadKey: UInt8 = 5
+    private let kSMCWriteKey: UInt8 = 6
+    private let kSMCGetKeyInfo: UInt8 = 9
 
     private let kSMCKeyNotFound: Int32 = -13987
 
@@ -36,8 +81,6 @@ final class SMCAccess {
 
     // MARK: - connection
 
-    /// Open a connection to AppleSMC. Returns false when AppleSMC is absent
-    /// (e.g. no VirtualSMC), in which case callers fall back to "read only".
     @discardableResult
     func open() -> Bool {
         if opened { return true }
@@ -57,26 +100,12 @@ final class SMCAccess {
             return false
         }
 
-        // Not all AppleSMC implementations need this, and a failure here is
-        // not fatal; the read/write calls below are what actually matter.
-        var dummy: UInt64 = 0
-        var dummyCount: UInt64 = 0
-        let openKr = IOConnectCallScalarMethod(connect, kSMCUserClientOpen,
-                                               nil, 0, &dummy, &dummyCount)
-        if openKr != KERN_SUCCESS {
-            NSLog("SMCAccess: open selector returned %d (continuing)", openKr)
-        }
-
         opened = true
         return true
     }
 
     func close() {
         guard opened else { return }
-        var dummy: UInt64 = 0
-        var dummyCount: UInt64 = 0
-        IOConnectCallScalarMethod(connect, kSMCUserClientClose, nil, 0,
-                                  &dummy, &dummyCount)
         IOServiceClose(connect)
         connect = 0
         opened = false
@@ -84,7 +113,7 @@ final class SMCAccess {
 
     // MARK: - key plumbing
 
-    /// SMC key string -> packed UInt32, the same way SMC_MAKE_IDENTIFIER does it.
+    /// "F0Ac" -> packed UInt32 the same way SMC_MAKE_IDENTIFIER does it.
     private func keyCode(_ key: String) -> UInt32? {
         guard key.count == 4 else { return nil }
         var v: UInt32 = 0
@@ -94,97 +123,71 @@ final class SMCAccess {
         return v
     }
 
-    /// SMCKeyData_t as used by AppleSMC.
-    private struct SMCKeyData {
-        struct KeyInfo {
-            var dataSize: UInt32 = 0
-            var dataType: UInt32 = 0
-            var dataAttributes: UInt8 = 0
+    /// Struct call into AppleSMC. Returns the kern result and the reply.
+    private func callStruct(_ input: inout SMCKeyData,
+                            _ output: inout SMCKeyData) -> kern_return_t {
+        var outputSize = MemoryLayout<SMCKeyData>.stride
+        return withUnsafePointer(to: &input) { inPtr in
+            inPtr.withMemoryRebound(to: UInt8.self, capacity: 1) { inBytes in
+                withUnsafeMutablePointer(to: &output) { outPtr in
+                    outPtr.withMemoryRebound(to: UInt8.self, capacity: 1) { outBytes in
+                        IOConnectCallStructMethod(connect,
+                                                  kSMCHandleYPCEvent,
+                                                  inBytes,
+                                                  MemoryLayout<SMCKeyData>.stride,
+                                                  outBytes,
+                                                  &outputSize)
+                    }
+                }
+            }
         }
-        struct KeyData {
-            var key: UInt32 = 0
-            var vers: UInt8 = 0
-            var pLimit: UInt16 = 0
-            var lTotal: UInt16 = 0
-            var result: UInt8 = 0
-            var status: UInt8 = 0
-            var data8: UInt8 = 0
-            var data32: UInt32 = 0
-            var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                        UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
-                (0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
-                 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0)
-        }
+    }
+
+    /// Ask AppleSMC for a key's size and type.
+    private func keyInfoBlocking(_ code: UInt32) -> SMCKeyData.KeyInfo? {
+        var req = SMCKeyData()
+        req.key = code
+        req.data8 = kSMCGetKeyInfo
+
+        var out = SMCKeyData()
+        let kr = callStruct(&req, &out)
+        guard kr == KERN_SUCCESS, out.keyInfo.dataSize > 0 else { return nil }
+        return out.keyInfo
     }
 
     /// Read the 4-char type of a key ("ui8 ", "fpe2", ...). nil if absent.
     func keyType(_ key: String) -> String? {
-        guard opened || open(), let code = keyCode(key) else { return nil }
+        guard opened || open(), let code = keyCode(key),
+              let info = keyInfoBlocking(code) else { return nil }
 
-        var input = SMCKeyData()
-        input.key = code
-        input.data8 = 9   // kSMCGetKeyInfo
-
-        var output = SMCKeyData()
-        var outputSize = MemoryLayout<SMCKeyData>.stride
-
-        let kr = withUnsafePointer(to: &input) { inPtr in
-            inPtr.withMemoryRebound(to: UInt8.self, capacity: 1) { ptr in
-                IOConnectCallStructMethod(connect, kSMCHandleYPCEvent,
-                                          ptr, MemoryLayout<SMCKeyData>.stride,
-                                          &output, &outputSize)
-            }
-        }
-        guard kr == KERN_SUCCESS else { return nil }
-
-        var t = output.keyInfo.dataType
+        var t = info.dataType
         var s = ""
         for _ in 0..<4 {
-            let c = Character(UnicodeScalar(UInt8(t >> 24)) )
-            s.append(c)
+            if let scalar = UnicodeScalar(UInt8(t >> 24)) {
+                s.append(Character(scalar))
+            }
             t <<= 8
         }
         return s
     }
 
-    /// Raw bytes of a key, up to 32.
+    /// Raw bytes of a key (up to 32). nil when the key does not exist.
     func readBytes(_ key: String) -> [UInt8]? {
         guard opened || open(), let code = keyCode(key) else { return nil }
 
-        var info = SMCKeyData()
-        info.key = code
-        info.data8 = 9
-        var infoOut = SMCKeyData()
-        var infoSize = MemoryLayout<SMCKeyData>.stride
-
-        let infoKr = withUnsafePointer(to: &info) { p in
-            p.withMemoryRebound(to: UInt8.self, capacity: 1) {
-                IOConnectCallStructMethod(connect, kSMCHandleYPCEvent,
-                                          $0, MemoryLayout<SMCKeyData>.stride,
-                                          &infoOut, &infoSize)
-            }
-        }
-        guard infoKr == KERN_SUCCESS, infoOut.keyInfo.dataSize > 0 else { return nil }
+        // The key must exist first; AppleSMC needs its size to answer reads.
+        guard let info = keyInfoBlocking(code) else { return nil }
 
         var req = SMCKeyData()
         req.key = code
-        req.data8 = 5   // kSMCReadKey
-        var out = SMCKeyData()
-        var outSize = MemoryLayout<SMCKeyData>.stride
+        req.data8 = kSMCReadKey
+        req.keyInfo = info
 
-        let kr = withUnsafePointer(to: &req) { p in
-            p.withMemoryRebound(to: UInt8.self, capacity: 1) {
-                IOConnectCallStructMethod(connect, kSMCHandleYPCEvent,
-                                          $0, MemoryLayout<SMCKeyData>.stride,
-                                          &out, &outSize)
-            }
-        }
+        var out = SMCKeyData()
+        let kr = callStruct(&req, &out)
         guard kr == KERN_SUCCESS else { return nil }
 
-        // The byte tuple is laid out contiguously; copy the used prefix.
-        let n = Int(min(infoOut.keyInfo.dataSize, 32))
+        let n = Int(min(info.dataSize, 32))
         return withUnsafeBytes(of: out.bytes) { raw in
             Array(raw.prefix(n))
         }
@@ -193,21 +196,23 @@ final class SMCAccess {
     /// Write up to 32 bytes. Returns a KERN_* result so the UI can explain a
     /// permission problem rather than silently dropping the write.
     ///
-    /// Note: writing SMC keys requires root. A non-root write returns
-    /// kIOReturnNotPrivileged and the caller surfaces that to the user
-    /// instead of pretending the profile changed.
+    /// Writing SMC keys requires root; a non-root attempt yields
+    /// kIOReturnNotPrivileged.
     func writeBytes(_ key: String, bytes: [UInt8]) -> kern_return_t {
         guard opened || open() else { return kIOReturnNotOpen }
         guard let code = keyCode(key), !bytes.isEmpty, bytes.count <= 32 else {
             return kIOReturnBadArgument
         }
+        guard let info = keyInfoBlocking(code) else { return kIOReturnNotFound }
 
         var req = SMCKeyData()
         req.key = code
-        req.data8 = 6   // kSMCWriteKey
+        req.data8 = kSMCWriteKey
+        req.keyInfo = info
         req.keyInfo.dataSize = UInt32(bytes.count)
-        req.keyInfo.dataType = 0
 
+        // Copy the payload into the tuple without going through safe indexing
+        // on a tuple, which Swift does not allow.
         withUnsafeMutableBytes(of: &req.bytes) { raw in
             for (i, b) in bytes.enumerated() where i < 32 {
                 raw[i] = b
@@ -215,15 +220,7 @@ final class SMCAccess {
         }
 
         var out = SMCKeyData()
-        var outSize = MemoryLayout<SMCKeyData>.stride
-        let kr = withUnsafePointer(to: &req) { p in
-            p.withMemoryRebound(to: UInt8.self, capacity: 1) {
-                IOConnectCallStructMethod(connect, kSMCHandleYPCEvent,
-                                          $0, MemoryLayout<SMCKeyData>.stride,
-                                          &out, &outSize)
-            }
-        }
-        return kr
+        return callStruct(&req, &out)
     }
 
     // MARK: - typed helpers
